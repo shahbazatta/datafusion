@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # Tafweej Data Fusion Platform
+  tafweej-app:
+    build: .
+    container_name: tafweej-fusion-app
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - ELASTICSEARCH_URL=${ELASTICSEARCH_URL:-https://20.174.24.88:9200/}
+      - ELASTICSEARCH_USER=${ELASTICSEARCH_USER:-elastic}
+      - ELASTICSEARCH_PASSWORD=${ELASTICSEARCH_PASSWORD:-u-mSjGSAzHYRo2uDMV_-}
+      - REACT_APP_API_URL=http://localhost:5000
+      - REACT_APP_MAPBOX_TOKEN=${REACT_APP_MAPBOX_TOKEN}
+      - CONGESTION_THRESHOLD_LOW=50
+      - CONGESTION_THRESHOLD_MEDIUM=150
+      - CONGESTION_THRESHOLD_HIGH=300
+      - PREDICTION_WINDOW_MINUTES=30
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://localhost:5000', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - tafweej-network
+    volumes:
+      - ./logs:/app/logs
+
+  # Optional: Elasticsearch container (if not using external instance)
+  # elasticsearch:
+  #   image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+  #   container_name: tafweej-elasticsearch
+  #   environment:
+  #     - discovery.type=single-node
+  #     - xpack.security.enabled=true
+  #     - ELASTIC_PASSWORD=u-mSjGSAzHYRo2uDMV_-
+  #   ports:
+  #     - "9200:9200"
+  #   volumes:
+  #     - elasticsearch-data:/usr/share/elasticsearch/data
+  #   networks:
+  #     - tafweej-network
+
+networks:
+  tafweej-network:
+    driver: bridge
+
+volumes:
+  elasticsearch-data:

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#050507" />
+    <meta name="description" content="Tafweej Data Fusion Platform – Real-Time Operational Intelligence for Pilgrim Movement Management in Mina" />
+
+    <!-- Fonts preconnect -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+    <title>Tafweej Data Fusion Platform</title>
+
+    <style>
+      /* Critical CSS – prevents flash */
+      html, body {
+        margin: 0; padding: 0;
+        background: #050507;
+        color: #fff;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      #root { min-height: 100vh; }
+
+      /* Loading screen */
+      #loading {
+        position: fixed; inset: 0;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        background: #050507;
+        gap: 1.5rem;
+        z-index: 9999;
+        transition: opacity 0.4s ease;
+      }
+      #loading.hide { opacity: 0; pointer-events: none; }
+      .loading-logo {
+        width: 56px; height: 56px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #A8880E, #D4AF37, #F0D060);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 1.75rem;
+        box-shadow: 0 8px 32px rgba(212,175,55,0.4);
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      .loading-title {
+        font-size: 1.1rem; font-weight: 700; letter-spacing: 0.02em;
+        background: linear-gradient(135deg, #D4AF37, #F0D060);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      }
+      .loading-bar {
+        width: 200px; height: 3px;
+        background: rgba(255,255,255,0.08);
+        border-radius: 99px; overflow: hidden;
+      }
+      .loading-bar-fill {
+        height: 100%; border-radius: 99px;
+        background: linear-gradient(90deg, #A8880E, #D4AF37, #F0D060);
+        animation: load 1.8s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,100%{transform:scale(1);opacity:1}
+        50%{transform:scale(0.95);opacity:0.8}
+      }
+      @keyframes load {
+        0%{width:0;margin-left:0}
+        50%{width:100%;margin-left:0}
+        100%{width:0;margin-left:100%}
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>JavaScript is required to run the Tafweej Data Fusion Platform.</noscript>
+
+    <!-- Loading screen -->
+    <div id="loading">
+      <div class="loading-logo">🛰️</div>
+      <div class="loading-title">TAFWEEJ DATA FUSION</div>
+      <div class="loading-bar"><div class="loading-bar-fill"></div></div>
+    </div>
+
+    <div id="root"></div>
+
+    <script>
+      // Hide loading screen once React mounts
+      window.addEventListener('load', function() {
+        setTimeout(function() {
+          var el = document.getElementById('loading');
+          if (el) { el.classList.add('hide'); setTimeout(function(){ el.remove(); }, 450); }
+        }, 800);
+      });
+    </script>
+  </body>
+</html>
