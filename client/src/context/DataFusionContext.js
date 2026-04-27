@@ -10,6 +10,7 @@ export const DataFusionProvider = ({ children }) => {
   const [tafweejData, setTafweejData] = useState([]);
   const [predictions, setPredictions] = useState([]);
   const [analytics, setAnalytics] = useState(null);
+  const [mapData, setMapData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [lastUpdate, setLastUpdate] = useState(null);
@@ -74,6 +75,16 @@ export const DataFusionProvider = ({ children }) => {
     }
   }, [API_URL]);
 
+  // Fetch map data (latest per group – used by MapView)
+  const fetchMapData = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_URL}/api/map-data`);
+      setMapData(response.data);
+    } catch (err) {
+      console.error('Error fetching map data:', err);
+    }
+  }, [API_URL]);
+
   // Fetch analytics
   const fetchAnalytics = useCallback(async () => {
     try {
@@ -92,9 +103,10 @@ export const DataFusionProvider = ({ children }) => {
       fetchCameraData(),
       fetchTafweejData(),
       fetchPredictions(),
-      fetchAnalytics()
+      fetchAnalytics(),
+      fetchMapData()
     ]);
-  }, [fetchFusedData, fetchRfidData, fetchCameraData, fetchTafweejData, fetchPredictions, fetchAnalytics]);
+  }, [fetchFusedData, fetchRfidData, fetchCameraData, fetchTafweejData, fetchPredictions, fetchAnalytics, fetchMapData]);
 
   // Initial data fetch and set up auto-refresh
   useEffect(() => {
@@ -111,6 +123,7 @@ export const DataFusionProvider = ({ children }) => {
     tafweejData,
     predictions,
     analytics,
+    mapData,
 
     // State
     loading,
@@ -124,6 +137,7 @@ export const DataFusionProvider = ({ children }) => {
     fetchTafweejData,
     fetchPredictions,
     fetchAnalytics,
+    fetchMapData,
     refreshAllData
   };
 

@@ -354,6 +354,185 @@ function getRiskRecommendation(riskLevel) {
   return recommendations[riskLevel] || 'Unknown risk level';
 }
 
+/**
+ * GET /api/map-data
+ * Latest record per group for live map visualization
+ *  - RFID:    latest per camp_label
+ *  - Camera:  latest per camp_label
+ *  - Tafweej: latest per batch_code
+ */
+app.get('/api/map-data', async (req, res) => {
+  try {
+    const [rfidRes, cameraRes, tafweejRes] = await Promise.all([
+      elasticsearchClient.search({
+        index: 'peoplestats_rfid',
+        body: {
+          size: 0,
+          query: { exists: { field: 'camp_label' } },
+          aggs: {
+            by_camp: {
+              terms: { field: 'camp_label.keyword', size: 200 },
+              aggs: {
+                latest: {
+                  top_hits: {
+                    size: 1,
+                    sort: [{ timestamp: { order: 'desc' } }],
+                    _source: true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }),
+      elasticsearchClient.search({
+        index: 'peoplestats_cam',
+        body: {
+          size: 0,
+          aggs: {
+            by_camp: {
+              terms: { field: 'camp_label.keyword', size: 200 },
+              aggs: {
+                latest: {
+                  top_hits: {
+                    size: 1,
+                    sort: [{ timestamp: { order: 'desc' } }],
+                    _source: true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }),
+      elasticsearchClient.search({
+        index: 'peoplestats_tafweej_app',
+        body: {
+          size: 0,
+          aggs: {
+            by_batch: {
+              terms: { field: 'batch_code.keyword', size: 500 },
+              aggs: {
+                latest: {
+                  top_hits: {
+                    size: 1,
+                    sort: [{ timestamp_sys: { order: 'desc' } }],
+                    _source: true
+                  }
+                }
+              }
+            }
+          }
+        }
+      })
+    ]);
+
+    // ── Coordinate parser ───────────────────────────────────────
+    function parseCoords(doc) {
+      let lat = null, lon = null;
+
+      // geometry as float array [lon, lat]
+      if (doc.geometry && Array.isArray(doc.geometry) && doc.geometry.length >= 2) {
+        lon = parseFloat(doc.geometry[0]);
+        lat = parseFloat(doc.geometry[1]);
+      }
+      // geometry as string "[lon, lat]"
+      else if (doc.geometry && typeof doc.geometry === 'string') {
+        try {
+          const cleaned = doc.geometry.replace(/'/g, '"').trim();
+          const coords = JSON.parse(cleaned);
+          if (Array.isArray(coords) && coords.length >= 2) {
+            lon = parseFloat(coords[0]);
+            lat = parseFloat(coords[1]);
+          }
+        } catch (_) { /* ignore parse errors */ }
+      }
+
+      // fallback: lat / longitude text or numeric fields
+      if (!lat || isNaN(lat)) lat = doc.latitude  ? parseFloat(doc.latitude)  : null;
+      if (!lon || isNaN(lon)) lon = doc.longitude ? parseFloat(doc.longitude) : null;
+
+      // fallback: coordinates array [lon, lat]
+      if ((!lat || isNaN(lat)) && doc.coordinates && Array.isArray(doc.coordinates)) {
+        lon = parseFloat(doc.coordinates[0]);
+        lat = parseFloat(doc.coordinates[1]);
+      }
+
+      return { lat, lon };
+    }
+
+    // ── Normalise RFID ──────────────────────────────────────────
+    const rfidPoints = (rfidRes.aggregations?.by_camp?.buckets || [])
+      .map(bucket => {
+        const doc = bucket.latest?.hits?.hits?.[0]?._source || {};
+        const { lat, lon } = parseCoords(doc);
+        return {
+          id:           bucket.key,
+          camp_label:   bucket.key,
+          lat, lon,
+          doc_count:    bucket.doc_count,
+          people_count: doc.people_count || 0,
+          timestamp:    doc.timestamp    || null
+        };
+      })
+      .filter(p => p.lat && p.lon && !isNaN(p.lat) && !isNaN(p.lon));
+
+    // ── Normalise Camera ────────────────────────────────────────
+    const cameraPoints = (cameraRes.aggregations?.by_camp?.buckets || [])
+      .map(bucket => {
+        const doc = bucket.latest?.hits?.hits?.[0]?._source || {};
+        const { lat, lon } = parseCoords(doc);
+        return {
+          id:           bucket.key,
+          camp_label:   bucket.key,
+          lat, lon,
+          doc_count:    bucket.doc_count,
+          people_count: doc.people_count          || 0,
+          enteredHour:  doc.EnteredSubtotal_Hour  || 0,
+          enteredToday: doc.EnteredSubtotal_Today || 0,
+          exitedHour:   doc.ExitedSubtotal_Hour   || 0,
+          exitedToday:  doc.ExitedSubtotal_Today  || 0,
+          timestamp:    doc.timestamp             || null
+        };
+      })
+      .filter(p => p.lat && p.lon && !isNaN(p.lat) && !isNaN(p.lon));
+
+    // ── Normalise Tafweej ───────────────────────────────────────
+    const tafweejPoints = (tafweejRes.aggregations?.by_batch?.buckets || [])
+      .map(bucket => {
+        const doc = bucket.latest?.hits?.hits?.[0]?._source || {};
+        const { lat, lon } = parseCoords(doc);
+        return {
+          id:           bucket.key,
+          batch_code:   bucket.key,
+          camp_label:   doc.label || doc.camp_label || 'Unknown',
+          lat, lon,
+          doc_count:    bucket.doc_count,
+          people_count: doc.people_count                || 0,
+          timestamp:    doc.timestamp_sys || doc.timestamp || null
+        };
+      })
+      .filter(p => p.lat && p.lon && !isNaN(p.lat) && !isNaN(p.lon));
+
+    console.log(`Map Data: RFID=${rfidPoints.length} Camera=${cameraPoints.length} Tafweej=${tafweejPoints.length}`);
+
+    res.json({
+      timestamp: new Date().toISOString(),
+      rfid:    rfidPoints,
+      camera:  cameraPoints,
+      tafweej: tafweejPoints,
+      counts: {
+        rfid:    rfidPoints.length,
+        camera:  cameraPoints.length,
+        tafweej: tafweejPoints.length
+      }
+    });
+  } catch (error) {
+    console.error('Map Data Error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch map data', details: error.message });
+  }
+});
+
 // ==================== ERROR HANDLING ====================
 
 app.use((err, req, res, next) => {
@@ -380,6 +559,7 @@ app.listen(PORT, () => {
   • GET /api/camera                - Camera counting data
   • GET /api/tafweej               - Smartphone app data
   • GET /api/fused                 - Fused data from all sources
+  • GET /api/map-data              - Latest per camp/batch (map view)
   • GET /api/congestion-prediction - Congestion predictions
   • GET /api/analytics             - Operational analytics
 
