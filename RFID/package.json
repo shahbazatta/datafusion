@@ -1,0 +1,17 @@
+{
+  "name": "dahua-camera-simulator",
+  "version": "1.0.0",
+  "description": "Dahua Camera Simulator with streaming API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "express": "^4.22.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
