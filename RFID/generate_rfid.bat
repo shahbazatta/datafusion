@@ -5,14 +5,13 @@ echo ========================================
 echo Multi-Server RFID Simulator Launcher (Background)
 echo ========================================
 
-REM Get inputs from user
-echo NOTE: Use a port range that does NOT overlap with the Camera simulator.
-echo       Camera simulator uses ports starting at 3000 by default.
-echo       Recommended RFID base port: 5000
+REM RFID ports start at 5000 (rfid_id = port, maps to camera_id = port - 2000 in camps.json)
+REM Camera simulator uses 3000-3606, so RFID uses 5000-5606 — no port conflicts.
+echo NOTE: RFID ports must be 5000-5606 (rfid_id = port, camera_id = port - 2000).
+echo       Camera simulator uses 3000-3606. Do NOT overlap.
 echo.
 set /p N="Enter number of instances (N): "
-set /p BASE_PORT="Enter base port number (P, recommended 5000): "
-set /p BASE_CAMERA_ID="Enter base camera_id (from camps.json, e.g. 3000): "
+set /p BASE_PORT="Enter base port number (P, must start at 5000): "
 set /a LAST_INDEX=%N%-1
 
 if "%N%"=="" (
@@ -25,18 +24,11 @@ if "%BASE_PORT%"=="" (
     pause
     exit /b 1
 )
-if "%BASE_CAMERA_ID%"=="" (
-    echo Error: Base camera_id cannot be empty!
-    pause
-    exit /b 1
-)
 
 echo.
 echo Starting %N% RFID simulator instances in background...
 set /a MAX_PORT=%BASE_PORT% + %LAST_INDEX%
-set /a MAX_CAM=%BASE_CAMERA_ID% + %LAST_INDEX%
-echo Ports: %BASE_PORT% to !MAX_PORT!
-echo Camera IDs: %BASE_CAMERA_ID% to !MAX_CAM!
+echo Ports (rfid_id): %BASE_PORT% to !MAX_PORT!
 echo.
 
 if not exist logs mkdir logs
@@ -46,13 +38,12 @@ if exist rfid_server_pids.txt del rfid_server_pids.txt
 
 for /l %%i in (0,1,%LAST_INDEX%) do (
     set /a PORT=%BASE_PORT% + %%i
-    set /a CAMERA_ID=%BASE_CAMERA_ID% + %%i
-    echo Starting RFID simulator on port !PORT! (camera_id=!CAMERA_ID!)...
+    echo Starting RFID simulator on port !PORT! (rfid_id=!PORT!)...
 
-    start /B "" node server.js !PORT! !CAMERA_ID! > logs\rfid_server_!PORT!.log 2>&1
+    start /B "" node server.js !PORT! > logs\rfid_server_!PORT!.log 2>&1
 
     echo !PORT! >> rfid_server_ports.txt
-    echo RFID simulator on port !PORT! (camera_id=!CAMERA_ID!) started
+    echo RFID simulator on port !PORT! started
     echo.
 )
 
@@ -63,8 +54,7 @@ echo.
 echo Ports in use:
 for /l %%i in (0,1,%LAST_INDEX%) do (
     set /a PORT=%BASE_PORT% + %%i
-    set /a CAMERA_ID=%BASE_CAMERA_ID% + %%i
-    echo   Port !PORT! ^(camera_id=!CAMERA_ID!^)
+    echo   Port !PORT!
 )
 echo.
 echo Individual log files:

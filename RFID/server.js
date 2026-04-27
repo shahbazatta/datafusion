@@ -5,9 +5,9 @@ const os = require("os");
 
 const app = express();
 const PORT = process.argv[2] || process.env.PORT || 3000;
-// Optional second arg lets RFID run on any port while mapping to the correct
-// camera_id in camps.json (e.g. node server.js 5002 3002)
-const readerId = parseInt(process.argv[3] || process.argv[2] || process.env.CAMERA_ID || PORT, 10);
+// RFID port is used directly as rfid_id to look up camp in camps.json.
+// rfid_id = camera_id + 2000, so port 5000 → rfid_id 5000 → camp_label same as camera_id 3000.
+const readerId = parseInt(PORT, 10);
 
 app.disable("x-powered-by");
 app.set("etag", false);
@@ -58,7 +58,7 @@ const campsData = loadJson(
 let campLabel = null;
 let campGate = null;
 if (Array.isArray(campsData)) {
-  const match = campsData.find((c) => c && c._source && c._source.camera_id === readerId);
+  const match = campsData.find((c) => c && c._source && c._source.rfid_id === readerId);
   if (match) {
     campLabel = match._source.camp_label;
     campGate = match._source.gate;
