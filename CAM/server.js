@@ -39,7 +39,7 @@ const cameraId = parseInt(PORT, 10);
 
 let campLabel = null;
 try {
-  const camps = JSON.parse(fs.readFileSync(path.join(__dirname, "camps.json"), "utf8"));
+  const camps = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "camps.json"), "utf8"));
   const match = camps.find((c) => c && c._source && c._source.camera_id === cameraId);
   if (match) campLabel = match._source.camp_label;
 } catch (e) {
@@ -48,7 +48,7 @@ try {
 
 let dispatches = [];
 try {
-  const schedRaw = JSON.parse(fs.readFileSync(path.join(__dirname, "schedule.json"), "utf8"));
+  const schedRaw = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "schedule.json"), "utf8"));
   const rows = schedRaw.Sheet1 || [];
   if (campLabel) {
     dispatches = rows

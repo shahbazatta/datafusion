@@ -51,8 +51,7 @@ function loadJson(...candidates) {
 }
 
 const campsData = loadJson(
-  path.join(__dirname, "..", "CAM", "camps.json"),
-  path.join(__dirname, "camps.json")
+  path.join(__dirname, "..", "camps.json")
 );
 
 let campLabel = null;
@@ -66,8 +65,7 @@ if (Array.isArray(campsData)) {
 }
 
 const schedRaw = loadJson(
-  path.join(__dirname, "..", "CAM", "schedule.json"),
-  path.join(__dirname, "schedule.json")
+  path.join(__dirname, "..", "schedule.json")
 );
 
 let dispatches = [];
