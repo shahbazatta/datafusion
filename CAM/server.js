@@ -11,13 +11,14 @@ app.set("etag", false);
 // --------------------
 // Simulation config
 // --------------------
-// Real-time: dispatching = pilgrims EXITING the camp at the scheduled hour:minute.
-// Batch is spread evenly over DISPATCH_DURATION_SEC real seconds so counters
-// ramp smoothly rather than jumping.
-// On startup the counters are pre-populated with whatever has already
-// dispatched today (synchronized to wall clock).
+// Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute.
+// Each pilgrim exit is emitted as a separate event with 1–2 s gaps between them.
 const TICK_MS = 1000;
-const DISPATCH_DURATION_SEC = 60;
+const PILGRIM_INTERVAL_MIN_MS = 1000; // min gap between individual exits
+const PILGRIM_INTERVAL_MAX_MS = 2000; // max gap between individual exits
+// Generous upper bound on how long a full batch takes (pilgrims × max_interval).
+// Used during startup catch-up to decide if a past dispatch is fully done.
+const MAX_PILGRIM_BATCH_SEC = 250 * (PILGRIM_INTERVAL_MAX_MS / 1000); // ~500 s
 
 // --------------------
 // camera_id → camp_label → schedule
@@ -41,6 +42,7 @@ try {
     dispatches = rows
       .filter((r) => r.camp_label === campLabel)
       .map((r) => ({
+        code:        r.code,
         disp_day:    Number(r.disp_day),
         disp_hour:   Number(r.disp_hour),
         disp_minute: Number(r.disp_minute),
@@ -54,7 +56,6 @@ try {
 }
 
 // Day cycling: use actual disp_day values from the schedule (e.g. [11, 12]).
-// Each real calendar day advances to the next schedule day, then loops.
 const scheduleDays = [...new Set(dispatches.map((d) => d.disp_day))].sort((a, b) => a - b);
 const simStart = Date.now();
 
@@ -64,39 +65,17 @@ function getSimDay() {
   return scheduleDays[daysPassed % scheduleDays.length];
 }
 
-// Cumulative exits for simDay up to current real wall-clock second.
-// Dispatching = people exiting the camp, so we only track exits.
-function cumulativeExited(simDay) {
-  const now = new Date();
-  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
-  let total = 0;
-  for (const d of dispatches) {
-    if (d.disp_day !== simDay) continue;
-    const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
-    const elapsed = nowSec - dispSec;
-    if (elapsed <= 0) continue;
-    total += elapsed >= DISPATCH_DURATION_SEC
-      ? d.pilgrims
-      : Math.floor(d.pilgrims * (elapsed / DISPATCH_DURATION_SEC));
+// Build an array of cumulative ms offsets (from batch-start) for each pilgrim.
+// e.g. [1400, 3200, 4700, ...] — times at which each pilgrim should be emitted.
+function buildEmissionOffsets(count) {
+  const offsets = [];
+  let cumulative = 0;
+  for (let i = 0; i < count; i++) {
+    cumulative += Math.floor(Math.random() * (PILGRIM_INTERVAL_MAX_MS - PILGRIM_INTERVAL_MIN_MS + 1))
+                  + PILGRIM_INTERVAL_MIN_MS;
+    offsets.push(cumulative);
   }
-  return total;
-}
-
-// Exits in a specific hour for simDay.
-function exitedInHour(simDay, hour) {
-  const now = new Date();
-  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
-  let total = 0;
-  for (const d of dispatches) {
-    if (d.disp_day !== simDay || d.disp_hour !== hour) continue;
-    const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
-    const elapsed = nowSec - dispSec;
-    if (elapsed <= 0) continue;
-    total += elapsed >= DISPATCH_DURATION_SEC
-      ? d.pilgrims
-      : Math.floor(d.pilgrims * (elapsed / DISPATCH_DURATION_SEC));
-  }
-  return total;
+  return offsets;
 }
 
 console.log(`[INIT] camera_id=${cameraId} camp_label=${campLabel || "(none)"} dispatches=${dispatches.length} scheduleDays=${scheduleDays}`);
@@ -121,6 +100,17 @@ let prevExitedToday  = 0;
 let prevTotalEntered = 0;
 let prevTotalExited  = 0;
 
+// Active batch queue.
+// Each entry: { disp, startRealMs, baseIdx, emittedCount, offsets }
+//   baseIdx:      how many pilgrims were already counted before this entry (for tag IDs)
+//   emittedCount: how many of `offsets` have fired so far
+//   offsets:      ms-from-startRealMs when each remaining pilgrim should exit
+let activeDispatches = [];
+
+// Keys already fired this sim-day — prevents double-firing if process restarts mid-minute.
+let firedDispatches = new Set();
+let currentSimDay = getSimDay();
+
 // --------------------
 // Logs
 // --------------------
@@ -144,6 +134,10 @@ function getLogFileName() {
 
 let logFile = getLogFileName();
 
+function logEvent(obj) {
+  fs.appendFileSync(logFile, JSON.stringify(obj) + "\n");
+}
+
 function logSnapshot(type) {
   const snapshot = {
     timestamp: new Date().toISOString(),
@@ -153,7 +147,7 @@ function logSnapshot(type) {
     enteredToday, exitedToday,
     totalEntered, totalExited,
   };
-  fs.appendFileSync(logFile, JSON.stringify(snapshot) + "\n");
+  logEvent(snapshot);
   console.log(`[LOGGED] ${type} snapshot → ${path.basename(logFile)}`);
 }
 
@@ -161,28 +155,66 @@ function logSnapshot(type) {
 // Periodic updater — real-time, wall-clock synchronized
 // --------------------
 function startSummaryUpdater() {
-  // Catch-up: pre-populate counters with what has already dispatched today.
-  let simDay = getSimDay();
-  let lastCumExited = cumulativeExited(simDay);
-  exitedToday = lastCumExited;
-  exitedHour  = exitedInHour(simDay, currentHour);
-  totalExited = lastCumExited;
+  // ── Startup catch-up ────────────────────────────────────────────────────────
+  // Pre-populate counters for batches that already started before this process launched.
+  const now0 = new Date();
+  const nowSec0 = now0.getHours() * 3600 + now0.getMinutes() * 60 + now0.getSeconds();
+  const AVG_INTERVAL_SEC = (PILGRIM_INTERVAL_MIN_MS + PILGRIM_INTERVAL_MAX_MS) / 2 / 1000; // 1.5 s
 
-  console.log(`[CATCHUP] simDay=${simDay} exitedToday=${exitedToday} exitedHour=${exitedHour}`);
+  for (const d of dispatches) {
+    if (d.disp_day !== currentSimDay) continue;
+    const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
+    const elapsed = nowSec0 - dispSec; // seconds since this batch should have started
+    if (elapsed <= 0) continue;        // not yet time
 
+    const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}-${d.code}`;
+    firedDispatches.add(key);
+
+    if (elapsed >= MAX_PILGRIM_BATCH_SEC) {
+      // Batch fully complete — count all pilgrims immediately.
+      if (d.disp_hour === currentHour) exitedHour += d.pilgrims;
+      exitedToday += d.pilgrims;
+      totalExited += d.pilgrims;
+      console.log(`[CATCHUP] Done  ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} pilgrims=${d.pilgrims}`);
+    } else {
+      // Batch still in progress — count already-emitted portion and queue the rest.
+      const alreadyEmitted = Math.min(d.pilgrims - 1, Math.floor(elapsed / AVG_INTERVAL_SEC));
+      if (alreadyEmitted > 0) {
+        if (d.disp_hour === currentHour) exitedHour += alreadyEmitted;
+        exitedToday += alreadyEmitted;
+        totalExited += alreadyEmitted;
+      }
+      const remaining = d.pilgrims - alreadyEmitted;
+      if (remaining > 0) {
+        activeDispatches.push({
+          disp:         d,
+          startRealMs:  Date.now(),
+          baseIdx:      alreadyEmitted,
+          emittedCount: 0,
+          offsets:      buildEmissionOffsets(remaining),
+        });
+        console.log(`[CATCHUP] InProg ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} alreadyEmitted=${alreadyEmitted} remaining=${remaining}`);
+      }
+    }
+  }
+
+  console.log(`[CATCHUP] exitedToday=${exitedToday} exitedHour=${exitedHour} totalExited=${totalExited}`);
+
+  // ── Main tick ────────────────────────────────────────────────────────────────
   setInterval(() => {
     const now = new Date();
 
     // Daily reset on real calendar day change.
     if (now.getDate() !== currentDate) {
       logSnapshot("daily");
-      currentDate = now.getDate();
-      simDay = getSimDay();
+      currentDate   = now.getDate();
+      currentSimDay = getSimDay();
+      firedDispatches.clear();
+      activeDispatches = [];
       enteredToday = 0;
       exitedToday  = 0;
-      lastCumExited = 0;
       logFile = getLogFileName();
-      console.log(`[RESET] Daily reset. New simDay=${simDay}`);
+      console.log(`[RESET] Daily reset. New simDay=${currentSimDay}`);
     }
 
     // Hourly reset on real hour change.
@@ -194,16 +226,70 @@ function startSummaryUpdater() {
       console.log(`[RESET] Hourly reset. hour=${currentHour}`);
     }
 
-    // Compute new cumulative exits and apply delta.
-    const newCumExited = cumulativeExited(simDay);
-    const dExited = Math.max(0, newCumExited - lastCumExited);
-    lastCumExited = newCumExited;
+    const nowHour   = now.getHours();
+    const nowMinute = now.getMinutes();
 
-    if (dExited > 0) {
-      exitedHour   += dExited;
-      exitedToday  += dExited;
-      totalExited  += dExited;
-      console.log(`[TICK] simDay=${simDay} hour=${currentHour} dExited=${dExited} exitedToday=${exitedToday} totalExited=${totalExited}`);
+    // Check each dispatch — fire if it's time and not yet fired.
+    for (const d of dispatches) {
+      if (d.disp_day !== currentSimDay) continue;
+      const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}-${d.code}`;
+      if (firedDispatches.has(key)) continue;
+      if (nowHour === d.disp_hour && nowMinute === d.disp_minute) {
+        firedDispatches.add(key);
+        activeDispatches.push({
+          disp:         d,
+          startRealMs:  Date.now(),
+          baseIdx:      0,
+          emittedCount: 0,
+          offsets:      buildEmissionOffsets(d.pilgrims),
+        });
+        console.log(`[DISPATCH] simDay=${currentSimDay} ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
+      }
+    }
+
+    // Drain active batches — emit individual pilgrim exits that are due.
+    let totalNewExits = 0;
+    const nowMs = Date.now();
+
+    for (const active of activeDispatches) {
+      const elapsedMs = nowMs - active.startRealMs;
+      let newCount = 0;
+
+      while (
+        active.emittedCount < active.offsets.length &&
+        active.offsets[active.emittedCount] <= elapsedMs
+      ) {
+        const pilgrimNum = active.baseIdx + active.emittedCount + 1;
+        const tagId = `${active.disp.code}-${String(pilgrimNum).padStart(4, "0")}`;
+
+        // Log the individual exit event.
+        logEvent({
+          timestamp:   now.toISOString(),
+          type:        "exit",
+          port:        parseInt(PORT, 10),
+          camp:        campLabel,
+          tagId,
+          pilgrimNum,
+          totalPilgrims: active.disp.pilgrims,
+        });
+
+        active.emittedCount++;
+        newCount++;
+      }
+
+      if (newCount > 0) {
+        exitedHour   += newCount;
+        exitedToday  += newCount;
+        totalExited  += newCount;
+        totalNewExits += newCount;
+      }
+    }
+
+    // Remove fully-emitted batches.
+    activeDispatches = activeDispatches.filter((a) => a.emittedCount < a.offsets.length);
+
+    if (totalNewExits > 0) {
+      console.log(`[TICK] simDay=${currentSimDay} hour=${currentHour} newExits=${totalNewExits} exitedToday=${exitedToday} totalExited=${totalExited}`);
     }
   }, TICK_MS);
 }
@@ -312,7 +398,7 @@ startSummaryUpdater();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Camera simulator running at http://0.0.0.0:${PORT}`);
   console.log(`Camera ${cameraId} → camp ${campLabel || "(unmapped)"} | ${dispatches.length} dispatches | days ${scheduleDays}`);
-  console.log(`Real-time mode: exits synchronized to wall clock (disp_hour:disp_minute)`);
+  console.log(`Real-time mode: individual pilgrim exits at 1–2 s intervals starting at disp_hour:disp_minute`);
 });
 
 process.on("SIGINT", () => {

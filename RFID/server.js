@@ -14,13 +14,14 @@ app.set("etag", false);
 // Simulation config
 // --------------------
 // Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute.
-// Each batch is spread evenly over DISPATCH_DURATION_SEC real seconds.
+// Each pilgrim exit is a separate RFID tag-scan event with 1–2 s gaps between them.
 // Only "Exit" events are emitted — dispatching means leaving the camp.
 const TICK_MS = 1000;
-const DISPATCH_DURATION_SEC = 60;
+const PILGRIM_INTERVAL_MIN_MS = 1000; // min gap between individual tag scans
+const PILGRIM_INTERVAL_MAX_MS = 2000; // max gap between individual tag scans
 
 // In-memory ring buffer of recent events (for streaming clients).
-const RECENT_EVENT_LIMIT = 100;
+const RECENT_EVENT_LIMIT = 500;
 
 // --------------------
 // Resolve reader_id → camp_label via camps.json
@@ -75,6 +76,18 @@ function getSimDay() {
   return scheduleDays[daysPassed % scheduleDays.length];
 }
 
+// Build an array of cumulative ms offsets (from batch-start) for each pilgrim.
+function buildEmissionOffsets(count) {
+  const offsets = [];
+  let cumulative = 0;
+  for (let i = 0; i < count; i++) {
+    cumulative += Math.floor(Math.random() * (PILGRIM_INTERVAL_MAX_MS - PILGRIM_INTERVAL_MIN_MS + 1))
+                  + PILGRIM_INTERVAL_MIN_MS;
+    offsets.push(cumulative);
+  }
+  return offsets;
+}
+
 console.log(
   `[INIT] reader_id=${readerId} camp_label=${campLabel || "(none)"} gate=${campGate || "-"} ` +
   `dispatches=${dispatches.length} scheduleDays=${scheduleDays}`
@@ -123,13 +136,15 @@ function logRfidEvent(event) {
 // --------------------
 let recentEvents = [];
 
-// firedDispatches: Set of keys "simDay-disp_hour-disp_minute" already triggered this cycle.
-let firedDispatches = new Set();
-
-// activeDispatches: batches currently being spread over DISPATCH_DURATION_SEC.
-// { disp, startRealMs, emittedCount }
+// Active batch queue — each entry covers a group of pilgrims being emitted over time.
+// { disp, startRealMs, baseIdx, emittedCount, offsets }
+//   baseIdx:      pilgrim number offset for tag ID generation
+//   emittedCount: how many of `offsets` have fired so far
+//   offsets:      ms-from-startRealMs when each remaining pilgrim should be scanned
 let activeDispatches = [];
 
+// Keys already fired this sim-day — prevents double-firing.
+let firedDispatches = new Set();
 let currentSimDay = getSimDay();
 
 const readerLocation = campLabel
@@ -173,38 +188,48 @@ function startRfidSimulator() {
     const nowHour   = now.getHours();
     const nowMinute = now.getMinutes();
 
-    // Check each dispatch: fire if it's time and hasn't been fired yet.
+    // Check each dispatch — fire if it's time and not yet fired.
     for (const d of dispatches) {
       if (d.disp_day !== currentSimDay) continue;
-      const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}`;
+      const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}-${d.code}`;
       if (firedDispatches.has(key)) continue;
       if (nowHour === d.disp_hour && nowMinute === d.disp_minute) {
         firedDispatches.add(key);
-        activeDispatches.push({ disp: d, startRealMs: Date.now(), emittedCount: 0 });
+        activeDispatches.push({
+          disp:         d,
+          startRealMs:  Date.now(),
+          baseIdx:      0,
+          emittedCount: 0,
+          offsets:      buildEmissionOffsets(d.pilgrims),
+        });
         console.log(`[DISPATCH] simDay=${currentSimDay} ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
       }
     }
 
-    // Drain active dispatches — emit events proportional to elapsed real time.
+    // Drain active batches — emit individual tag scans that are due.
     let totalEmitted = 0;
-    for (const active of activeDispatches) {
-      const elapsedSec = (Date.now() - active.startRealMs) / 1000;
-      const targetCount = elapsedSec >= DISPATCH_DURATION_SEC
-        ? active.disp.pilgrims
-        : Math.floor(active.disp.pilgrims * (elapsedSec / DISPATCH_DURATION_SEC));
+    const nowMs = Date.now();
 
-      const toEmit = targetCount - active.emittedCount;
-      for (let i = 0; i < toEmit; i++) {
-        const idx = active.emittedCount + i + 1;
-        const tagId = `${active.disp.code}-${String(idx).padStart(4, "0")}`;
+    for (const active of activeDispatches) {
+      const elapsedMs = nowMs - active.startRealMs;
+      let newCount = 0;
+
+      while (
+        active.emittedCount < active.offsets.length &&
+        active.offsets[active.emittedCount] <= elapsedMs
+      ) {
+        const pilgrimNum = active.baseIdx + active.emittedCount + 1;
+        const tagId = `${active.disp.code}-${String(pilgrimNum).padStart(4, "0")}`;
         emitEvent(tagId);
-        totalEmitted++;
+        active.emittedCount++;
+        newCount++;
       }
-      active.emittedCount = targetCount;
+
+      totalEmitted += newCount;
     }
 
-    // Remove fully emitted dispatches.
-    activeDispatches = activeDispatches.filter((a) => a.emittedCount < a.disp.pilgrims);
+    // Remove fully-emitted batches.
+    activeDispatches = activeDispatches.filter((a) => a.emittedCount < a.offsets.length);
 
     if (totalEmitted > 0) {
       console.log(`[RFID] Emitted ${totalEmitted} Exit event(s); buffer=${recentEvents.length}`);
@@ -222,8 +247,6 @@ function generateRfidPayload() {
 function generateHeartbeat() {
   return `--myboundary\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nHeartbeat`;
 }
-
-let lastEventCount = 0;
 
 // --------------------
 // Routes
@@ -245,8 +268,9 @@ app.get("/cgi-bin/videoStatServer.cgi", (req, res) => {
   res.write(
     `--myboundary\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}\r\n`
   );
-  lastEventCount = recentEvents.length;
 
+  // Per-connection snapshot — avoids cross-client corruption.
+  let lastEventCount = recentEvents.length;
   let heartbeatCount = 0;
 
   const interval = setInterval(() => {
@@ -303,7 +327,7 @@ startRfidSimulator();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`RFID simulator running at http://0.0.0.0:${PORT}`);
   console.log(`Reader ${readerId} → ${readerLocation} | ${dispatches.length} dispatches | days ${scheduleDays}`);
-  console.log(`Real-time mode: Exit events synchronized to wall clock (disp_hour:disp_minute)`);
+  console.log(`Real-time mode: individual pilgrim tag scans at 1–2 s intervals starting at disp_hour:disp_minute`);
 });
 
 process.on("SIGINT", () => {
