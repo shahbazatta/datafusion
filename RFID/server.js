@@ -5,39 +5,25 @@ const os = require("os");
 
 const app = express();
 const PORT = process.argv[2] || process.env.PORT || 3000;
-// RFID port is used directly as rfid_id to look up camp in camps.json.
-// rfid_id = camera_id + 2000, so port 5000 → rfid_id 5000 → camp_label same as camera_id 3000.
 const readerId = parseInt(PORT, 10);
 
 app.disable("x-powered-by");
 app.set("etag", false);
 
 // --------------------
-// Simulation config (mirrors the camera simulator)
+// Simulation config
 // --------------------
-// 1 real second = SPEED_FACTOR simulated seconds.
-// Schedule covers days 11-12 → 2 sim days = 172800 sim sec.
-// At 60x → ~48 min per cycle.
-const SPEED_FACTOR = 60;
+// Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute.
+// Each batch is spread evenly over DISPATCH_DURATION_SEC real seconds.
+// Only "Exit" events are emitted — dispatching means leaving the camp.
 const TICK_MS = 1000;
-const SCHEDULE_DAY_BASE = 11;
-// Each scheduled batch of `pilgrims` is dispatched over this window
-// (linear ramp), so RFID Entry events trickle in instead of flooding.
-const DISPATCH_DURATION_SIM_SEC = 60;
-// Pilgrims walk away then come back; Exit events lag Entry by this much.
-const EXIT_LAG_SIM_SEC = 2 * 3600;
-// Spread the exit phase over a window so Exit events trickle too.
-const EXIT_DURATION_SIM_SEC = 60;
-// Total sim duration of the schedule. After this (+ exit-drain tail) the
-// simulator resets and replays from sim-day 11 again.
-const SCHEDULE_TOTAL_SIM_SEC = 2 * 86400;
-const LOOP_TAIL_SIM_SEC = EXIT_LAG_SIM_SEC + EXIT_DURATION_SIM_SEC;
+const DISPATCH_DURATION_SEC = 60;
 
 // In-memory ring buffer of recent events (for streaming clients).
 const RECENT_EVENT_LIMIT = 100;
 
 // --------------------
-// Resolve this instance's reader_id (= port) → camp_label → schedule
+// Resolve reader_id → camp_label via camps.json
 // --------------------
 function loadJson(...candidates) {
   for (const p of candidates) {
@@ -50,9 +36,7 @@ function loadJson(...candidates) {
   return null;
 }
 
-const campsData = loadJson(
-  path.join(__dirname, "..", "camps.json")
-);
+const campsData = loadJson(path.join(__dirname, "..", "camps.json"));
 
 let campLabel = null;
 let campGate = null;
@@ -60,61 +44,40 @@ if (Array.isArray(campsData)) {
   const match = campsData.find((c) => c && c._source && c._source.rfid_id === readerId);
   if (match) {
     campLabel = match._source.camp_label;
-    campGate = match._source.gate;
+    campGate  = match._source.gate;
   }
 }
 
-const schedRaw = loadJson(
-  path.join(__dirname, "..", "schedule.json")
-);
+const schedRaw = loadJson(path.join(__dirname, "..", "schedule.json"));
 
 let dispatches = [];
 if (schedRaw && schedRaw.Sheet1 && campLabel) {
   dispatches = schedRaw.Sheet1
     .filter((r) => r.camp_label === campLabel)
     .map((r) => ({
-      code: r.code,
-      pilgrims: Number(r.pilgrims) || 0,
-      schedSimSec:
-        (Number(r.disp_day) - SCHEDULE_DAY_BASE) * 86400 +
-        Number(r.disp_hour) * 3600 +
-        Number(r.disp_minute) * 60,
+      code:        r.code,
+      disp_day:    Number(r.disp_day),
+      disp_hour:   Number(r.disp_hour),
+      disp_minute: Number(r.disp_minute),
+      pilgrims:    Number(r.pilgrims) || 0,
     }))
-    .filter((d) => d.pilgrims > 0 && d.schedSimSec >= 0)
-    .sort((a, b) => a.schedSimSec - b.schedSimSec);
+    .filter((d) => d.pilgrims > 0)
+    .sort((a, b) => (a.disp_hour * 60 + a.disp_minute) - (b.disp_hour * 60 + b.disp_minute));
 }
 
-// --------------------
-// Pre-compute the full event timeline for one schedule cycle.
-// Each pilgrim → one Entry event + one Exit event with the same tagId.
-// --------------------
-function buildTimeline() {
-  const events = [];
-  for (const d of dispatches) {
-    for (let i = 0; i < d.pilgrims; i++) {
-      const frac = (i + 0.5) / d.pilgrims; // even spread
-      const tagId = `${d.code}-${String(i + 1).padStart(4, "0")}`;
-      events.push({
-        simSec: d.schedSimSec + frac * DISPATCH_DURATION_SIM_SEC,
-        tagId,
-        eventType: "Entry",
-      });
-      events.push({
-        simSec: d.schedSimSec + EXIT_LAG_SIM_SEC + frac * EXIT_DURATION_SIM_SEC,
-        tagId,
-        eventType: "Exit",
-      });
-    }
-  }
-  events.sort((a, b) => a.simSec - b.simSec);
-  return events;
-}
+// Day cycling: same logic as CAM simulator.
+const scheduleDays = [...new Set(dispatches.map((d) => d.disp_day))].sort((a, b) => a - b);
+const simStart = Date.now();
 
-const timeline = buildTimeline();
+function getSimDay() {
+  if (!scheduleDays.length) return 11;
+  const daysPassed = Math.floor((Date.now() - simStart) / 86400000);
+  return scheduleDays[daysPassed % scheduleDays.length];
+}
 
 console.log(
   `[INIT] reader_id=${readerId} camp_label=${campLabel || "(none)"} gate=${campGate || "-"} ` +
-    `dispatches=${dispatches.length} timelineEvents=${timeline.length}`
+  `dispatches=${dispatches.length} scheduleDays=${scheduleDays}`
 );
 
 // --------------------
@@ -124,7 +87,6 @@ function getLogFileName() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-
   const nets = os.networkInterfaces();
   let ipAddress = "unknown";
   for (const name of Object.keys(nets)) {
@@ -136,19 +98,21 @@ function getLogFileName() {
     }
     if (ipAddress !== "unknown") break;
   }
-
   return path.join(__dirname, "logs", `rfid_events_${date}_${ipAddress}.log`);
 }
 
 if (!fs.existsSync(path.join(__dirname, "logs"))) {
-  fs.mkdirSync(path.join(__dirname, "logs"));
+  fs.mkdirSync(path.join(__dirname, "logs"), { recursive: true });
 }
 
 let logFile = getLogFileName();
 let currentDate = new Date().getDate();
 
-// Touch the log file immediately so it exists even before any events fire.
-fs.appendFileSync(logFile, JSON.stringify({ timestamp: new Date().toISOString(), type: "startup", readerId, campLabel, dispatches: dispatches.length }) + "\n");
+// Touch the log file on startup.
+fs.appendFileSync(
+  logFile,
+  JSON.stringify({ timestamp: new Date().toISOString(), type: "startup", readerId, campLabel, dispatches: dispatches.length }) + "\n"
+);
 
 function logRfidEvent(event) {
   fs.appendFileSync(logFile, JSON.stringify(event) + "\n");
@@ -157,23 +121,30 @@ function logRfidEvent(event) {
 // --------------------
 // Simulation state
 // --------------------
-let simStart = Date.now();
-let nextEventIdx = 0;
 let recentEvents = [];
+
+// firedDispatches: Set of keys "simDay-disp_hour-disp_minute" already triggered this cycle.
+let firedDispatches = new Set();
+
+// activeDispatches: batches currently being spread over DISPATCH_DURATION_SEC.
+// { disp, startRealMs, emittedCount }
+let activeDispatches = [];
+
+let currentSimDay = getSimDay();
 
 const readerLocation = campLabel
   ? `Camp ${campLabel}${campGate ? ` (Gate ${campGate})` : ""}`
   : `Reader ${readerId}`;
 
-function emitEvent(tpl) {
+function emitEvent(tagId) {
   const now = new Date();
   const event = {
     timestamp: now.toISOString(),
     timestampFormatted: now.toLocaleString("sv").replace("T", " ").slice(0, 19),
     port: parseInt(PORT, 10),
-    tagId: tpl.tagId,
+    tagId,
     readerLocation,
-    eventType: tpl.eventType,
+    eventType: "Exit",
     signalStrength_dBm: -Math.floor(Math.random() * 51 + 50), // -50 to -100 dBm
   };
   recentEvents.push(event);
@@ -182,10 +153,9 @@ function emitEvent(tpl) {
   return event;
 }
 
-function getSimSec() {
-  return ((Date.now() - simStart) / 1000) * SPEED_FACTOR;
-}
-
+// --------------------
+// Periodic updater — real-time, wall-clock synchronized
+// --------------------
 function startRfidSimulator() {
   setInterval(() => {
     const now = new Date();
@@ -194,30 +164,50 @@ function startRfidSimulator() {
     if (now.getDate() !== currentDate) {
       currentDate = now.getDate();
       logFile = getLogFileName();
-      console.log("[LOG ROTATE] New log file:", path.basename(logFile));
+      firedDispatches.clear();
+      activeDispatches = [];
+      currentSimDay = getSimDay();
+      console.log(`[LOG ROTATE] New day — simDay=${currentSimDay} log: ${path.basename(logFile)}`);
     }
 
-    let simSec = getSimSec();
+    const nowHour   = now.getHours();
+    const nowMinute = now.getMinutes();
 
-    // Loop the schedule once it (plus exit-drain tail) finishes.
-    if (simSec >= SCHEDULE_TOTAL_SIM_SEC + LOOP_TAIL_SIM_SEC) {
-      console.log("[LOOP] Schedule cycle complete — restarting RFID simulator.");
-      simStart = Date.now();
-      nextEventIdx = 0;
-      simSec = 0;
+    // Check each dispatch: fire if it's time and hasn't been fired yet.
+    for (const d of dispatches) {
+      if (d.disp_day !== currentSimDay) continue;
+      const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}`;
+      if (firedDispatches.has(key)) continue;
+      if (nowHour === d.disp_hour && nowMinute === d.disp_minute) {
+        firedDispatches.add(key);
+        activeDispatches.push({ disp: d, startRealMs: Date.now(), emittedCount: 0 });
+        console.log(`[DISPATCH] simDay=${currentSimDay} ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
+      }
     }
 
-    if (timeline.length === 0) return;
+    // Drain active dispatches — emit events proportional to elapsed real time.
+    let totalEmitted = 0;
+    for (const active of activeDispatches) {
+      const elapsedSec = (Date.now() - active.startRealMs) / 1000;
+      const targetCount = elapsedSec >= DISPATCH_DURATION_SEC
+        ? active.disp.pilgrims
+        : Math.floor(active.disp.pilgrims * (elapsedSec / DISPATCH_DURATION_SEC));
 
-    let emitted = 0;
-    while (nextEventIdx < timeline.length && timeline[nextEventIdx].simSec <= simSec) {
-      emitEvent(timeline[nextEventIdx]);
-      nextEventIdx++;
-      emitted++;
+      const toEmit = targetCount - active.emittedCount;
+      for (let i = 0; i < toEmit; i++) {
+        const idx = active.emittedCount + i + 1;
+        const tagId = `${active.disp.code}-${String(idx).padStart(4, "0")}`;
+        emitEvent(tagId);
+        totalEmitted++;
+      }
+      active.emittedCount = targetCount;
     }
 
-    if (emitted > 0) {
-      console.log(`[RFID] Emitted ${emitted} scheduled event(s); buffer=${recentEvents.length}`);
+    // Remove fully emitted dispatches.
+    activeDispatches = activeDispatches.filter((a) => a.emittedCount < a.disp.pilgrims);
+
+    if (totalEmitted > 0) {
+      console.log(`[RFID] Emitted ${totalEmitted} Exit event(s); buffer=${recentEvents.length}`);
     }
   }, TICK_MS);
 }
@@ -230,11 +220,7 @@ function generateRfidPayload() {
 }
 
 function generateHeartbeat() {
-  return `--myboundary
-Content-Type: text/plain
-Content-Length: 9
-
-Heartbeat`;
+  return `--myboundary\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nHeartbeat`;
 }
 
 let lastEventCount = 0;
@@ -255,32 +241,26 @@ app.get("/cgi-bin/videoStatServer.cgi", (req, res) => {
   });
   res.status(200);
 
-  let payload = generateRfidPayload();
-  res.write(`--myboundary
-Content-Type: application/json
-Content-Length: ${Buffer.byteLength(payload)}
-
-${payload}
-`);
+  const payload = generateRfidPayload();
+  res.write(
+    `--myboundary\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}\r\n`
+  );
+  lastEventCount = recentEvents.length;
 
   let heartbeatCount = 0;
 
   const interval = setInterval(() => {
     try {
       if (recentEvents.length !== lastEventCount) {
-        payload = generateRfidPayload();
-        res.write(`--myboundary
-Content-Type: application/json
-Content-Length: ${Buffer.byteLength(payload)}
-
-${payload}
-`);
+        const p = generateRfidPayload();
+        res.write(
+          `--myboundary\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(p)}\r\n\r\n${p}\r\n`
+        );
         console.log(`Sent RFID update (${recentEvents.length} events)`);
         lastEventCount = recentEvents.length;
         heartbeatCount = 0;
       } else {
-        const hb = generateHeartbeat();
-        res.write(hb + "\n");
+        res.write(generateHeartbeat() + "\r\n");
         heartbeatCount++;
         console.log(`Sent heartbeat #${heartbeatCount}`);
       }
@@ -294,6 +274,7 @@ ${payload}
     console.log("Client disconnected from RFID stream");
     clearInterval(interval);
   });
+  req.on("error", () => clearInterval(interval));
 });
 
 app.get("/cgi-bin/logs", (req, res) => {
@@ -302,22 +283,18 @@ app.get("/cgi-bin/logs", (req, res) => {
     res.set({
       Server: "Device/1.0",
       "Content-Type": "text/plain",
-      "Content-Length": Buffer.byteLength(logs, "utf8"),
+      "Content-Length": String(Buffer.byteLength(logs, "utf8")),
+      Connection: "close",
     });
-    res.send(logs);
+    res.status(200).end(logs);
   } else {
-    res.status(404).send("No log file found");
+    res.set({ Server: "Device/1.0", "Content-Type": "text/plain", "Content-Length": "0", Connection: "close" });
+    res.status(404).end();
   }
 });
 
-app.all("/cgi-bin/*catchall", (req, res) => {
-  console.log("Generic /cgi-bin hit:", req.originalUrl);
-  res.set({
-    Server: "Device/1.0",
-    "Content-Type": "text/plain",
-    "Content-Length": "0",
-    Connection: "close",
-  });
+app.all("/cgi-bin/*", (req, res) => {
+  res.set({ Server: "Device/1.0", "Content-Type": "text/plain", "Content-Length": "0", Connection: "close" });
   res.status(200).end();
 });
 
@@ -325,9 +302,8 @@ startRfidSimulator();
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`RFID simulator running at http://0.0.0.0:${PORT}`);
-  console.log(`Logging to file: ${logFile}`);
-  console.log(`Reader ${readerId} → ${readerLocation} with ${dispatches.length} scheduled dispatches (${timeline.length} events/cycle)`);
-  console.log(`Sim speed: ${SPEED_FACTOR}x (full 2-day schedule completes in ~${Math.round(SCHEDULE_TOTAL_SIM_SEC / SPEED_FACTOR / 60)} min, then loops)`);
+  console.log(`Reader ${readerId} → ${readerLocation} | ${dispatches.length} dispatches | days ${scheduleDays}`);
+  console.log(`Real-time mode: Exit events synchronized to wall clock (disp_hour:disp_minute)`);
 });
 
 process.on("SIGINT", () => {

@@ -5,35 +5,22 @@ const os = require("os");
 const app = express();
 const PORT = process.argv[2] || process.env.PORT || 3000;
 
-// Strip Express defaults
 app.disable("x-powered-by");
 app.set("etag", false);
 
 // --------------------
 // Simulation config
 // --------------------
-// 1 real second = SPEED_FACTOR simulated seconds.
-// Schedule spans days 11-12 = 2 sim days = 172800 sim sec.
-// At 60x → 2880 real sec ≈ 48 min for the whole schedule.
-const SPEED_FACTOR = 60;
+// Real-time: dispatching = pilgrims EXITING the camp at the scheduled hour:minute.
+// Batch is spread evenly over DISPATCH_DURATION_SEC real seconds so counters
+// ramp smoothly rather than jumping.
+// On startup the counters are pre-populated with whatever has already
+// dispatched today (synchronized to wall clock).
 const TICK_MS = 1000;
-const SCHEDULE_DAY_BASE = 11;
-// A scheduled batch of `pilgrims` people enters over this many sim seconds
-// (linear ramp), so counters tick up smoothly instead of jumping.
-const DISPATCH_DURATION_SIM_SEC = 60;
-// Pilgrims walk away then come back; exit count lags entry count.
-const EXIT_LAG_SIM_SEC = 2 * 3600;
-// Spread the exit phase over a window so it ramps in too.
-const EXIT_DURATION_SIM_SEC = 60;
-// Total sim duration of the schedule (days 11-12). After this, the
-// simulator loops back to sim-day 11 and replays — totals keep growing,
-// hour/today counters reset naturally via the sim-day/hour change checks.
-const SCHEDULE_TOTAL_SIM_SEC = 2 * 86400;
-// Pause (in sim seconds) between loops so the last exits can drain.
-const LOOP_TAIL_SIM_SEC = EXIT_LAG_SIM_SEC + EXIT_DURATION_SIM_SEC;
+const DISPATCH_DURATION_SEC = 60;
 
 // --------------------
-// Resolve this instance's camera_id → camp_label → schedule
+// camera_id → camp_label → schedule
 // --------------------
 const cameraId = parseInt(PORT, 10);
 
@@ -54,56 +41,93 @@ try {
     dispatches = rows
       .filter((r) => r.camp_label === campLabel)
       .map((r) => ({
-        pilgrims: Number(r.pilgrims) || 0,
-        schedSimSec:
-          (Number(r.disp_day) - SCHEDULE_DAY_BASE) * 86400 +
-          Number(r.disp_hour) * 3600 +
-          Number(r.disp_minute) * 60,
+        disp_day:    Number(r.disp_day),
+        disp_hour:   Number(r.disp_hour),
+        disp_minute: Number(r.disp_minute),
+        pilgrims:    Number(r.pilgrims) || 0,
       }))
-      .filter((d) => d.pilgrims > 0 && d.schedSimSec >= 0)
-      .sort((a, b) => a.schedSimSec - b.schedSimSec);
+      .filter((d) => d.pilgrims > 0)
+      .sort((a, b) => (a.disp_hour * 60 + a.disp_minute) - (b.disp_hour * 60 + b.disp_minute));
   }
 } catch (e) {
   console.warn("Could not read schedule.json:", e.message);
 }
 
-console.log(`[INIT] camera_id=${cameraId} camp_label=${campLabel || "(none)"} dispatches=${dispatches.length}`);
+// Day cycling: use actual disp_day values from the schedule (e.g. [11, 12]).
+// Each real calendar day advances to the next schedule day, then loops.
+const scheduleDays = [...new Set(dispatches.map((d) => d.disp_day))].sort((a, b) => a - b);
+const simStart = Date.now();
+
+function getSimDay() {
+  if (!scheduleDays.length) return 11;
+  const daysPassed = Math.floor((Date.now() - simStart) / 86400000);
+  return scheduleDays[daysPassed % scheduleDays.length];
+}
+
+// Cumulative exits for simDay up to current real wall-clock second.
+// Dispatching = people exiting the camp, so we only track exits.
+function cumulativeExited(simDay) {
+  const now = new Date();
+  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  let total = 0;
+  for (const d of dispatches) {
+    if (d.disp_day !== simDay) continue;
+    const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
+    const elapsed = nowSec - dispSec;
+    if (elapsed <= 0) continue;
+    total += elapsed >= DISPATCH_DURATION_SEC
+      ? d.pilgrims
+      : Math.floor(d.pilgrims * (elapsed / DISPATCH_DURATION_SEC));
+  }
+  return total;
+}
+
+// Exits in a specific hour for simDay.
+function exitedInHour(simDay, hour) {
+  const now = new Date();
+  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  let total = 0;
+  for (const d of dispatches) {
+    if (d.disp_day !== simDay || d.disp_hour !== hour) continue;
+    const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
+    const elapsed = nowSec - dispSec;
+    if (elapsed <= 0) continue;
+    total += elapsed >= DISPATCH_DURATION_SEC
+      ? d.pilgrims
+      : Math.floor(d.pilgrims * (elapsed / DISPATCH_DURATION_SEC));
+  }
+  return total;
+}
+
+console.log(`[INIT] camera_id=${cameraId} camp_label=${campLabel || "(none)"} dispatches=${dispatches.length} scheduleDays=${scheduleDays}`);
 
 // --------------------
-// State (device memory)
+// State
 // --------------------
-let enteredHour = 0;
-let exitedHour = 0;
+let enteredHour  = 0;
+let exitedHour   = 0;
 let enteredToday = 0;
-let exitedToday = 0;
+let exitedToday  = 0;
 let totalEntered = 0;
-let totalExited = 0;
+let totalExited  = 0;
 
-// Cumulative entered/exited derived from schedule (for delta computation).
-let lastCumEntered = 0;
-let lastCumExited = 0;
+let currentHour = new Date().getHours();
+let currentDate = new Date().getDate();
 
-// Sim-time hour/day for resets (independent of wall clock).
-let simStart = Date.now();
-let prevSimHour = 0;
-let prevSimDay = 0;
-
-// Track previous values for change detection (streaming endpoint).
-let prevEnteredHour = 0;
-let prevExitedHour = 0;
+let prevEnteredHour  = 0;
+let prevExitedHour   = 0;
 let prevEnteredToday = 0;
-let prevExitedToday = 0;
+let prevExitedToday  = 0;
 let prevTotalEntered = 0;
-let prevTotalExited = 0;
+let prevTotalExited  = 0;
 
-// ------------------------------------
-// Log files: date-time-ip-address naming
-// ------------------------------------
+// --------------------
+// Logs
+// --------------------
 function getLogFileName() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   const dateTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-
   const nets = os.networkInterfaces();
   let ipAddress = "unknown";
   for (const name of Object.keys(nets)) {
@@ -115,125 +139,78 @@ function getLogFileName() {
     }
     if (ipAddress !== "unknown") break;
   }
-
   return path.join(__dirname, `summary_${dateTime}_${ipAddress}.log`);
 }
 
 let logFile = getLogFileName();
 
 function logSnapshot(type) {
-  const now = new Date();
   const snapshot = {
-    timestamp: now.toISOString(),
+    timestamp: new Date().toISOString(),
     type,
     port: parseInt(PORT, 10),
-    enteredHour,
-    exitedHour,
-    enteredToday,
-    exitedToday,
-    totalEntered,
-    totalExited,
+    enteredHour, exitedHour,
+    enteredToday, exitedToday,
+    totalEntered, totalExited,
   };
   fs.appendFileSync(logFile, JSON.stringify(snapshot) + "\n");
-  console.log(`[LOGGED] ${type} snapshot saved to ${path.basename(logFile)}`);
+  console.log(`[LOGGED] ${type} snapshot → ${path.basename(logFile)}`);
 }
 
 // --------------------
-// Schedule-driven cumulative counts
+// Periodic updater — real-time, wall-clock synchronized
 // --------------------
-function cumulativeFromDispatches(simSec, durationSec) {
-  let total = 0;
-  for (const d of dispatches) {
-    const elapsed = simSec - d.schedSimSec;
-    if (elapsed <= 0) continue;
-    if (elapsed >= durationSec) total += d.pilgrims;
-    else total += Math.floor(d.pilgrims * (elapsed / durationSec));
-  }
-  return total;
-}
-
-function getSimSec() {
-  return ((Date.now() - simStart) / 1000) * SPEED_FACTOR;
-}
-
-// ---------------------------------------------------
-// Periodic updater: drives counters from the schedule
-// ---------------------------------------------------
 function startSummaryUpdater() {
+  // Catch-up: pre-populate counters with what has already dispatched today.
+  let simDay = getSimDay();
+  let lastCumExited = cumulativeExited(simDay);
+  exitedToday = lastCumExited;
+  exitedHour  = exitedInHour(simDay, currentHour);
+  totalExited = lastCumExited;
+
+  console.log(`[CATCHUP] simDay=${simDay} exitedToday=${exitedToday} exitedHour=${exitedHour}`);
+
   setInterval(() => {
-    let simSec = getSimSec();
+    const now = new Date();
 
-    // Loop the schedule once it (plus exit-drain tail) finishes.
-    if (simSec >= SCHEDULE_TOTAL_SIM_SEC + LOOP_TAIL_SIM_SEC) {
-      console.log("[LOOP] Schedule cycle complete — restarting simulator.");
-      simStart = Date.now();
-      lastCumEntered = 0;
-      lastCumExited = 0;
-      simSec = 0;
-    }
-
-    const simDayIdx = Math.floor(simSec / 86400);
-    const secInDay = simSec - simDayIdx * 86400;
-    const simHour = Math.floor(secInDay / 3600);
-
-    // Daily reset on sim-day change (also rotates log file).
-    if (simDayIdx !== prevSimDay) {
+    // Daily reset on real calendar day change.
+    if (now.getDate() !== currentDate) {
       logSnapshot("daily");
-      prevSimDay = simDayIdx;
+      currentDate = now.getDate();
+      simDay = getSimDay();
       enteredToday = 0;
-      exitedToday = 0;
+      exitedToday  = 0;
+      lastCumExited = 0;
       logFile = getLogFileName();
-      console.log("[RESET] Sim daily counters reset. New log file:", logFile);
+      console.log(`[RESET] Daily reset. New simDay=${simDay}`);
     }
 
-    // Hourly reset on sim-hour change.
-    if (simHour !== prevSimHour) {
+    // Hourly reset on real hour change.
+    if (now.getHours() !== currentHour) {
       logSnapshot("hourly");
-      prevSimHour = simHour;
+      currentHour = now.getHours();
       enteredHour = 0;
-      exitedHour = 0;
-      console.log(`[RESET] Sim hourly counters reset (sim day=${SCHEDULE_DAY_BASE + simDayIdx} hour=${simHour}).`);
+      exitedHour  = 0;
+      console.log(`[RESET] Hourly reset. hour=${currentHour}`);
     }
 
-    const curEntered = cumulativeFromDispatches(simSec, DISPATCH_DURATION_SIM_SEC);
-    const curExited = cumulativeFromDispatches(simSec - EXIT_LAG_SIM_SEC, EXIT_DURATION_SIM_SEC);
+    // Compute new cumulative exits and apply delta.
+    const newCumExited = cumulativeExited(simDay);
+    const dExited = Math.max(0, newCumExited - lastCumExited);
+    lastCumExited = newCumExited;
 
-    const dEntered = Math.max(0, curEntered - lastCumEntered);
-    let dExited = Math.max(0, curExited - lastCumExited);
-
-    // Exit can never outpace entries.
-    if (curExited > curEntered) dExited = Math.max(0, curEntered - lastCumExited);
-
-    lastCumEntered = curEntered;
-    lastCumExited = lastCumExited + dExited;
-
-    enteredHour += dEntered;
-    exitedHour += dExited;
-    enteredToday += dEntered;
-    exitedToday += dExited;
-    totalEntered += dEntered;
-    totalExited += dExited;
-
-    if (dEntered || dExited) {
-      console.log("Sim tick:", {
-        simDay: SCHEDULE_DAY_BASE + simDayIdx,
-        simHour,
-        dEntered,
-        dExited,
-        enteredHour,
-        exitedHour,
-        enteredToday,
-        exitedToday,
-        totalEntered,
-        totalExited,
-      });
+    if (dExited > 0) {
+      exitedHour   += dExited;
+      exitedToday  += dExited;
+      totalExited  += dExited;
+      console.log(`[TICK] simDay=${simDay} hour=${currentHour} dExited=${dExited} exitedToday=${exitedToday} totalExited=${totalExited}`);
     }
   }, TICK_MS);
 }
 
-// ---------------------------
-// Response body (key=value)
-// ---------------------------
+// --------------------
+// Response body (key=value) — format unchanged
+// --------------------
 function generateSummary() {
   const nowEpoch = Math.floor(Date.now() / 1000);
   return `summary.Channel=0
@@ -250,22 +227,22 @@ summary.UTC=${nowEpoch}`;
 
 function hasStatsChanged() {
   return (
-    enteredHour !== prevEnteredHour ||
-    exitedHour !== prevExitedHour ||
+    enteredHour  !== prevEnteredHour  ||
+    exitedHour   !== prevExitedHour   ||
     enteredToday !== prevEnteredToday ||
-    exitedToday !== prevExitedToday ||
+    exitedToday  !== prevExitedToday  ||
     totalEntered !== prevTotalEntered ||
-    totalExited !== prevTotalExited
+    totalExited  !== prevTotalExited
   );
 }
 
 function updatePreviousStats() {
-  prevEnteredHour = enteredHour;
-  prevExitedHour = exitedHour;
+  prevEnteredHour  = enteredHour;
+  prevExitedHour   = exitedHour;
   prevEnteredToday = enteredToday;
-  prevExitedToday = exitedToday;
+  prevExitedToday  = exitedToday;
   prevTotalEntered = totalEntered;
-  prevTotalExited = totalExited;
+  prevTotalExited  = totalExited;
 }
 
 function generateHeartbeat() {
@@ -276,12 +253,11 @@ Content-Length:9
 Heartbeat`;
 }
 
-// ---------------------------
-// Routes
-// ---------------------------
+// --------------------
+// Routes — unchanged
+// --------------------
 app.get("/cgi-bin/videoStatServer.cgi", (req, res) => {
-  console.log("videoStatServer.cgi called with streaming mode:", req.query);
-
+  console.log("videoStatServer.cgi called:", req.query);
   res.set({
     Server: "Device/1.0",
     Connection: "keep-alive",
@@ -293,86 +269,53 @@ app.get("/cgi-bin/videoStatServer.cgi", (req, res) => {
   res.status(200);
 
   updatePreviousStats();
-
-  const initialSummary = generateSummary();
-  res.write(initialSummary + "\n\n");
-  console.log("Sent initial summary block");
+  res.write(generateSummary() + "\n\n");
 
   let heartbeatCount = 0;
-
   const interval = setInterval(() => {
     try {
       if (hasStatsChanged()) {
-        const summaryBlock = generateSummary();
-        res.write(summaryBlock + "\n\n");
-        console.log("Sent summary update (stats changed)");
+        res.write(generateSummary() + "\n\n");
         updatePreviousStats();
         heartbeatCount = 0;
       } else {
-        const heartbeat = generateHeartbeat();
-        res.write(heartbeat + "\n\n");
+        res.write(generateHeartbeat() + "\n\n");
         heartbeatCount++;
-        console.log(`Sent heartbeat #${heartbeatCount}`);
       }
-    } catch (error) {
-      console.error("Error writing to response stream:", error);
+    } catch (err) {
       clearInterval(interval);
     }
   }, 5000);
 
-  req.on("close", () => {
-    console.log("Client disconnected from videoStatServer.cgi stream");
-    clearInterval(interval);
-  });
-
-  req.on("error", (error) => {
-    console.error("Connection error in videoStatServer.cgi:", error);
-    clearInterval(interval);
-  });
+  req.on("close", () => clearInterval(interval));
+  req.on("error", () => clearInterval(interval));
 });
 
 app.get("/cgi-bin/logs", (req, res) => {
   if (fs.existsSync(logFile)) {
     const logs = fs.readFileSync(logFile, "utf8");
-    res.set({
-      Server: "Device/1.0",
-      Connection: "close",
-      "Content-Type": "text/plain",
-      "Content-Length": String(Buffer.byteLength(logs, "utf8")),
-    });
+    res.set({ Server: "Device/1.0", Connection: "close", "Content-Type": "text/plain", "Content-Length": String(Buffer.byteLength(logs, "utf8")) });
     res.status(200).end(logs);
   } else {
-    res.set({
-      Server: "Device/1.0",
-      Connection: "close",
-      "Content-Type": "text/plain",
-      "Content-Length": "0",
-    });
+    res.set({ Server: "Device/1.0", Connection: "close", "Content-Type": "text/plain", "Content-Length": "0" });
     res.status(404).end();
   }
 });
 
 app.all("/cgi-bin/*", (req, res) => {
-  console.log("Generic /cgi-bin hit:", req.originalUrl);
-  res.set({
-    Server: "Device/1.0",
-    "Content-Type": "text/plain",
-    "Content-Length": "0",
-    Connection: "close",
-  });
+  res.set({ Server: "Device/1.0", "Content-Type": "text/plain", "Content-Length": "0", Connection: "close" });
   res.status(200).end();
 });
 
 startSummaryUpdater();
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running at http://0.0.0.0:${PORT}`);
-  console.log(`Logging to file: ${logFile}`);
-  console.log(`Camera ${cameraId} → camp ${campLabel || "(unmapped)"} with ${dispatches.length} scheduled dispatches`);
-  console.log(`Sim speed: ${SPEED_FACTOR}x (full 2-day schedule completes in ~${Math.round((2 * 86400) / SPEED_FACTOR / 60)} min)`);
+  console.log(`Camera simulator running at http://0.0.0.0:${PORT}`);
+  console.log(`Camera ${cameraId} → camp ${campLabel || "(unmapped)"} | ${dispatches.length} dispatches | days ${scheduleDays}`);
+  console.log(`Real-time mode: exits synchronized to wall clock (disp_hour:disp_minute)`);
 });
 
 process.on("SIGINT", () => {
-  console.log("\nShutting down server gracefully...");
+  console.log("\nShutting down gracefully...");
   process.exit(0);
 });
