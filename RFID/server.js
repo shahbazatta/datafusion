@@ -13,12 +13,35 @@ app.set("etag", false);
 // --------------------
 // Simulation config
 // --------------------
-// Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute.
+// Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute (KSA time).
 // Each pilgrim exit is a separate RFID tag-scan event with 1–2 s gaps between them.
 // Only "Exit" events are emitted — dispatching means leaving the camp.
 const TICK_MS = 1000;
 const PILGRIM_INTERVAL_MIN_MS = 1000; // min gap between individual tag scans
 const PILGRIM_INTERVAL_MAX_MS = 2000; // max gap between individual tag scans
+
+// --------------------
+// KSA timezone helper (GMT+3) — all wall-clock comparisons use KSA time
+// so that disp_hour / disp_minute from schedule.json match correctly
+// regardless of the OS timezone of the host server.
+// --------------------
+const KSA_OFFSET_MS = 3 * 60 * 60 * 1000;
+
+function ksaNow() {
+  const utcMs = Date.now();
+  const d = new Date(utcMs + KSA_OFFSET_MS);
+  const pad = (n) => String(n).padStart(2, "0");
+  return {
+    hours:   d.getUTCHours(),
+    minutes: d.getUTCMinutes(),
+    seconds: d.getUTCSeconds(),
+    date:    d.getUTCDate(),
+    month:   d.getUTCMonth(),
+    year:    d.getUTCFullYear(),
+    isoString: `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T` +
+               `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}+03:00`,
+  };
+}
 
 // In-memory ring buffer of recent events (for streaming clients).
 const RECENT_EVENT_LIMIT = 500;
@@ -90,16 +113,16 @@ function buildEmissionOffsets(count) {
 
 console.log(
   `[INIT] reader_id=${readerId} camp_label=${campLabel || "(none)"} gate=${campGate || "-"} ` +
-  `dispatches=${dispatches.length} scheduleDays=${scheduleDays}`
+  `dispatches=${dispatches.length} scheduleDays=${scheduleDays} ksaTime=${ksaNow().isoString}`
 );
 
 // --------------------
 // Logs
 // --------------------
 function getLogFileName() {
-  const now = new Date();
+  const k = ksaNow();
   const pad = (n) => String(n).padStart(2, "0");
-  const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const date = `${k.year}-${pad(k.month + 1)}-${pad(k.date)}`;
   const nets = os.networkInterfaces();
   let ipAddress = "unknown";
   for (const name of Object.keys(nets)) {
@@ -119,12 +142,12 @@ if (!fs.existsSync(path.join(__dirname, "logs"))) {
 }
 
 let logFile = getLogFileName();
-let currentDate = new Date().getDate();
+let currentDate = ksaNow().date;
 
 // Touch the log file on startup.
 fs.appendFileSync(
   logFile,
-  JSON.stringify({ timestamp: new Date().toISOString(), type: "startup", readerId, campLabel, dispatches: dispatches.length }) + "\n"
+  JSON.stringify({ timestamp: ksaNow().isoString, type: "startup", readerId, campLabel, dispatches: dispatches.length }) + "\n"
 );
 
 function logRfidEvent(event) {
@@ -152,10 +175,10 @@ const readerLocation = campLabel
   : `Reader ${readerId}`;
 
 function emitEvent(tagId) {
-  const now = new Date();
+  const k = ksaNow();
   const event = {
-    timestamp: now.toISOString(),
-    timestampFormatted: now.toLocaleString("sv").replace("T", " ").slice(0, 19),
+    timestamp: k.isoString,
+    timestampFormatted: k.isoString.slice(0, 19).replace("T", " "),
     port: parseInt(PORT, 10),
     tagId,
     readerLocation,
@@ -173,20 +196,20 @@ function emitEvent(tagId) {
 // --------------------
 function startRfidSimulator() {
   setInterval(() => {
-    const now = new Date();
+    const k = ksaNow();
 
-    // Rotate log file on new wall-clock day.
-    if (now.getDate() !== currentDate) {
-      currentDate = now.getDate();
+    // Rotate log file on KSA calendar day change.
+    if (k.date !== currentDate) {
+      currentDate = k.date;
       logFile = getLogFileName();
       firedDispatches.clear();
       activeDispatches = [];
       currentSimDay = getSimDay();
-      console.log(`[LOG ROTATE] New day — simDay=${currentSimDay} log: ${path.basename(logFile)}`);
+      console.log(`[LOG ROTATE] New KSA day — simDay=${currentSimDay} log: ${path.basename(logFile)}`);
     }
 
-    const nowHour   = now.getHours();
-    const nowMinute = now.getMinutes();
+    const nowHour   = k.hours;
+    const nowMinute = k.minutes;
 
     // Check each dispatch — fire if it's time and not yet fired.
     for (const d of dispatches) {
@@ -327,7 +350,7 @@ startRfidSimulator();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`RFID simulator running at http://0.0.0.0:${PORT}`);
   console.log(`Reader ${readerId} → ${readerLocation} | ${dispatches.length} dispatches | days ${scheduleDays}`);
-  console.log(`Real-time mode: individual pilgrim tag scans at 1–2 s intervals starting at disp_hour:disp_minute`);
+  console.log(`Timezone: KSA (GMT+3) | current KSA time: ${ksaNow().isoString}`);
 });
 
 process.on("SIGINT", () => {

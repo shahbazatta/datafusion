@@ -11,14 +11,38 @@ app.set("etag", false);
 // --------------------
 // Simulation config
 // --------------------
-// Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute.
+// Real-time: dispatching = pilgrims EXITING the camp at disp_hour:disp_minute (KSA time).
 // Each pilgrim exit is emitted as a separate event with 1–2 s gaps between them.
 const TICK_MS = 1000;
 const PILGRIM_INTERVAL_MIN_MS = 1000; // min gap between individual exits
 const PILGRIM_INTERVAL_MAX_MS = 2000; // max gap between individual exits
 // Generous upper bound on how long a full batch takes (pilgrims × max_interval).
-// Used during startup catch-up to decide if a past dispatch is fully done.
 const MAX_PILGRIM_BATCH_SEC = 250 * (PILGRIM_INTERVAL_MAX_MS / 1000); // ~500 s
+
+// --------------------
+// KSA timezone helper (GMT+3) — all wall-clock comparisons use KSA time
+// so that disp_hour / disp_minute from schedule.json match correctly
+// regardless of the OS timezone of the host server.
+// --------------------
+const KSA_OFFSET_MS = 3 * 60 * 60 * 1000;
+
+function ksaNow() {
+  // Returns a plain object with KSA local time fields.
+  const utcMs = Date.now();
+  const d = new Date(utcMs + KSA_OFFSET_MS); // shift UTC → KSA
+  const pad = (n) => String(n).padStart(2, "0");
+  return {
+    hours:   d.getUTCHours(),
+    minutes: d.getUTCMinutes(),
+    seconds: d.getUTCSeconds(),
+    date:    d.getUTCDate(),
+    month:   d.getUTCMonth(),
+    year:    d.getUTCFullYear(),
+    // ISO string with +03:00 suffix for logs/events
+    isoString: `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T` +
+               `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}+03:00`,
+  };
+}
 
 // --------------------
 // camera_id → camp_label → schedule
@@ -66,7 +90,6 @@ function getSimDay() {
 }
 
 // Build an array of cumulative ms offsets (from batch-start) for each pilgrim.
-// e.g. [1400, 3200, 4700, ...] — times at which each pilgrim should be emitted.
 function buildEmissionOffsets(count) {
   const offsets = [];
   let cumulative = 0;
@@ -78,7 +101,8 @@ function buildEmissionOffsets(count) {
   return offsets;
 }
 
-console.log(`[INIT] camera_id=${cameraId} camp_label=${campLabel || "(none)"} dispatches=${dispatches.length} scheduleDays=${scheduleDays}`);
+const ksa0 = ksaNow();
+console.log(`[INIT] camera_id=${cameraId} camp_label=${campLabel || "(none)"} dispatches=${dispatches.length} scheduleDays=${scheduleDays} ksaTime=${ksa0.isoString}`);
 
 // --------------------
 // State
@@ -90,8 +114,9 @@ let exitedToday  = 0;
 let totalEntered = 0;
 let totalExited  = 0;
 
-let currentHour = new Date().getHours();
-let currentDate = new Date().getDate();
+// Initialise current hour/date from KSA time.
+let currentHour = ksaNow().hours;
+let currentDate = ksaNow().date;
 
 let prevEnteredHour  = 0;
 let prevExitedHour   = 0;
@@ -101,13 +126,10 @@ let prevTotalEntered = 0;
 let prevTotalExited  = 0;
 
 // Active batch queue.
-// Each entry: { disp, startRealMs, baseIdx, emittedCount, offsets }
-//   baseIdx:      how many pilgrims were already counted before this entry (for tag IDs)
-//   emittedCount: how many of `offsets` have fired so far
-//   offsets:      ms-from-startRealMs when each remaining pilgrim should exit
+// { disp, startRealMs, baseIdx, emittedCount, offsets }
 let activeDispatches = [];
 
-// Keys already fired this sim-day — prevents double-firing if process restarts mid-minute.
+// Keys already fired this sim-day.
 let firedDispatches = new Set();
 let currentSimDay = getSimDay();
 
@@ -115,9 +137,9 @@ let currentSimDay = getSimDay();
 // Logs
 // --------------------
 function getLogFileName() {
-  const now = new Date();
+  const k = ksaNow();
   const pad = (n) => String(n).padStart(2, "0");
-  const dateTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+  const dateTime = `${k.year}-${pad(k.month+1)}-${pad(k.date)}_${pad(k.hours)}-${pad(k.minutes)}-${pad(k.seconds)}`;
   const nets = os.networkInterfaces();
   let ipAddress = "unknown";
   for (const name of Object.keys(nets)) {
@@ -140,7 +162,7 @@ function logEvent(obj) {
 
 function logSnapshot(type) {
   const snapshot = {
-    timestamp: new Date().toISOString(),
+    timestamp: ksaNow().isoString,
     type,
     port: parseInt(PORT, 10),
     enteredHour, exitedHour,
@@ -152,26 +174,25 @@ function logSnapshot(type) {
 }
 
 // --------------------
-// Periodic updater — real-time, wall-clock synchronized
+// Periodic updater — KSA wall-clock synchronized
 // --------------------
 function startSummaryUpdater() {
   // ── Startup catch-up ────────────────────────────────────────────────────────
-  // Pre-populate counters for batches that already started before this process launched.
-  const now0 = new Date();
-  const nowSec0 = now0.getHours() * 3600 + now0.getMinutes() * 60 + now0.getSeconds();
+  const k0 = ksaNow();
+  const nowSec0 = k0.hours * 3600 + k0.minutes * 60 + k0.seconds;
   const AVG_INTERVAL_SEC = (PILGRIM_INTERVAL_MIN_MS + PILGRIM_INTERVAL_MAX_MS) / 2 / 1000; // 1.5 s
 
   for (const d of dispatches) {
     if (d.disp_day !== currentSimDay) continue;
     const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
-    const elapsed = nowSec0 - dispSec; // seconds since this batch should have started
-    if (elapsed <= 0) continue;        // not yet time
+    const elapsed = nowSec0 - dispSec; // seconds since this batch should have started (KSA)
+    if (elapsed <= 0) continue;
 
     const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}-${d.code}`;
     firedDispatches.add(key);
 
     if (elapsed >= MAX_PILGRIM_BATCH_SEC) {
-      // Batch fully complete — count all pilgrims immediately.
+      // Batch fully complete.
       if (d.disp_hour === currentHour) exitedHour += d.pilgrims;
       exitedToday += d.pilgrims;
       totalExited += d.pilgrims;
@@ -202,39 +223,36 @@ function startSummaryUpdater() {
 
   // ── Main tick ────────────────────────────────────────────────────────────────
   setInterval(() => {
-    const now = new Date();
+    const k = ksaNow();
 
-    // Daily reset on real calendar day change.
-    if (now.getDate() !== currentDate) {
+    // Daily reset on KSA calendar day change.
+    if (k.date !== currentDate) {
       logSnapshot("daily");
-      currentDate   = now.getDate();
+      currentDate   = k.date;
       currentSimDay = getSimDay();
       firedDispatches.clear();
       activeDispatches = [];
       enteredToday = 0;
       exitedToday  = 0;
       logFile = getLogFileName();
-      console.log(`[RESET] Daily reset. New simDay=${currentSimDay}`);
+      console.log(`[RESET] Daily reset (KSA). New simDay=${currentSimDay}`);
     }
 
-    // Hourly reset on real hour change.
-    if (now.getHours() !== currentHour) {
+    // Hourly reset on KSA hour change.
+    if (k.hours !== currentHour) {
       logSnapshot("hourly");
-      currentHour = now.getHours();
+      currentHour = k.hours;
       enteredHour = 0;
       exitedHour  = 0;
-      console.log(`[RESET] Hourly reset. hour=${currentHour}`);
+      console.log(`[RESET] Hourly reset (KSA). hour=${currentHour}`);
     }
 
-    const nowHour   = now.getHours();
-    const nowMinute = now.getMinutes();
-
-    // Check each dispatch — fire if it's time and not yet fired.
+    // Check each dispatch — fire if KSA time matches and not yet fired.
     for (const d of dispatches) {
       if (d.disp_day !== currentSimDay) continue;
       const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}-${d.code}`;
       if (firedDispatches.has(key)) continue;
-      if (nowHour === d.disp_hour && nowMinute === d.disp_minute) {
+      if (k.hours === d.disp_hour && k.minutes === d.disp_minute) {
         firedDispatches.add(key);
         activeDispatches.push({
           disp:         d,
@@ -243,7 +261,7 @@ function startSummaryUpdater() {
           emittedCount: 0,
           offsets:      buildEmissionOffsets(d.pilgrims),
         });
-        console.log(`[DISPATCH] simDay=${currentSimDay} ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
+        console.log(`[DISPATCH] simDay=${currentSimDay} KSA ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
       }
     }
 
@@ -262,12 +280,11 @@ function startSummaryUpdater() {
         const pilgrimNum = active.baseIdx + active.emittedCount + 1;
         const tagId = `${active.disp.code}-${String(pilgrimNum).padStart(4, "0")}`;
 
-        // Log the individual exit event.
         logEvent({
-          timestamp:   now.toISOString(),
-          type:        "exit",
-          port:        parseInt(PORT, 10),
-          camp:        campLabel,
+          timestamp:     ksaNow().isoString,
+          type:          "exit",
+          port:          parseInt(PORT, 10),
+          camp:          campLabel,
           tagId,
           pilgrimNum,
           totalPilgrims: active.disp.pilgrims,
@@ -278,9 +295,9 @@ function startSummaryUpdater() {
       }
 
       if (newCount > 0) {
-        exitedHour   += newCount;
-        exitedToday  += newCount;
-        totalExited  += newCount;
+        exitedHour    += newCount;
+        exitedToday   += newCount;
+        totalExited   += newCount;
         totalNewExits += newCount;
       }
     }
@@ -289,7 +306,7 @@ function startSummaryUpdater() {
     activeDispatches = activeDispatches.filter((a) => a.emittedCount < a.offsets.length);
 
     if (totalNewExits > 0) {
-      console.log(`[TICK] simDay=${currentSimDay} hour=${currentHour} newExits=${totalNewExits} exitedToday=${exitedToday} totalExited=${totalExited}`);
+      console.log(`[TICK] simDay=${currentSimDay} ksaHour=${currentHour} newExits=${totalNewExits} exitedToday=${exitedToday} totalExited=${totalExited}`);
     }
   }, TICK_MS);
 }
@@ -398,7 +415,7 @@ startSummaryUpdater();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Camera simulator running at http://0.0.0.0:${PORT}`);
   console.log(`Camera ${cameraId} → camp ${campLabel || "(unmapped)"} | ${dispatches.length} dispatches | days ${scheduleDays}`);
-  console.log(`Real-time mode: individual pilgrim exits at 1–2 s intervals starting at disp_hour:disp_minute`);
+  console.log(`Timezone: KSA (GMT+3) | current KSA time: ${ksaNow().isoString}`);
 });
 
 process.on("SIGINT", () => {
