@@ -247,22 +247,25 @@ function startSummaryUpdater() {
       console.log(`[RESET] Hourly reset (KSA). hour=${currentHour}`);
     }
 
-    // Check each dispatch — fire if KSA time matches and not yet fired.
+    // Check each dispatch — fire if KSA time has reached or passed the dispatch
+    // time and not yet fired. Using >= (not ==) so a delayed tick never misses
+    // a dispatch that fell exactly between two ticks.
+    const nowSec = k.hours * 3600 + k.minutes * 60 + k.seconds;
     for (const d of dispatches) {
       if (d.disp_day !== currentSimDay) continue;
+      const dispSec = d.disp_hour * 3600 + d.disp_minute * 60;
+      if (nowSec < dispSec) continue;       // not yet time
       const key = `${currentSimDay}-${d.disp_hour}-${d.disp_minute}-${d.code}`;
       if (firedDispatches.has(key)) continue;
-      if (k.hours === d.disp_hour && k.minutes === d.disp_minute) {
-        firedDispatches.add(key);
-        activeDispatches.push({
-          disp:         d,
-          startRealMs:  Date.now(),
-          baseIdx:      0,
-          emittedCount: 0,
-          offsets:      buildEmissionOffsets(d.pilgrims),
-        });
-        console.log(`[DISPATCH] simDay=${currentSimDay} KSA ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
-      }
+      firedDispatches.add(key);
+      activeDispatches.push({
+        disp:         d,
+        startRealMs:  Date.now(),
+        baseIdx:      0,
+        emittedCount: 0,
+        offsets:      buildEmissionOffsets(d.pilgrims),
+      });
+      console.log(`[DISPATCH] simDay=${currentSimDay} KSA ${d.disp_hour}:${String(d.disp_minute).padStart(2,"0")} camp=${campLabel} pilgrims=${d.pilgrims}`);
     }
 
     // Drain active batches — emit individual pilgrim exits that are due.
@@ -280,15 +283,19 @@ function startSummaryUpdater() {
         const pilgrimNum = active.baseIdx + active.emittedCount + 1;
         const tagId = `${active.disp.code}-${String(pilgrimNum).padStart(4, "0")}`;
 
-        logEvent({
-          timestamp:     ksaNow().isoString,
-          type:          "exit",
-          port:          parseInt(PORT, 10),
-          camp:          campLabel,
-          tagId,
-          pilgrimNum,
-          totalPilgrims: active.disp.pilgrims,
-        });
+        try {
+          logEvent({
+            timestamp:     ksaNow().isoString,
+            type:          "exit",
+            port:          parseInt(PORT, 10),
+            camp:          campLabel,
+            tagId,
+            pilgrimNum,
+            totalPilgrims: active.disp.pilgrims,
+          });
+        } catch (e) {
+          // Log write failure is non-fatal — counters still update
+        }
 
         active.emittedCount++;
         newCount++;
@@ -319,6 +326,7 @@ function generateSummary() {
   return `summary.Channel=0
 summary.RuleName=NumberStat
 summary.Port=${PORT}
+summary.CampLabel=${campLabel || ""}
 summary.EnteredSubtotal.Hour=${enteredHour}
 summary.EnteredSubtotal.Today=${enteredToday}
 summary.EnteredSubtotal.Total=${totalEntered}
